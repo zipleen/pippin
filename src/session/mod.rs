@@ -340,6 +340,16 @@ impl Session {
         }
     }
 
+    /// Curtain mode, for a shared console session: `on` hides the session
+    /// from the Mac's own display behind a lock screen that shows `note`;
+    /// off shows it again, so the Mac's own keyboard and mouse can be used.
+    /// The host does not answer; it may decline.
+    pub fn set_curtain(&self, on: bool, note: &str) {
+        if let Some(c) = self.control() {
+            c.send(&messages::session_visibility(!on, note));
+        }
+    }
+
     /// Pointer position in canvas pixels plus the RFB button mask.
     pub fn pointer(&self, buttons: u8, x: u16, y: u16) {
         if let Some(c) = self.control() {

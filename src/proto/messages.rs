@@ -153,6 +153,28 @@ pub fn fbu_request(incremental: bool, x: u16, y: u16, w: u16, h: u16) -> Vec<u8>
     m
 }
 
+/// Most note bytes the server takes; a longer session visibility message is
+/// rejected whole (rootshell-vnc, `AppleCurtainProtocol`, MIT).
+pub const CURTAIN_NOTE_MAX: usize = 512;
+
+/// msg 12 session visibility (curtain mode): `visible` false hides the
+/// session from the Mac's own display (a lock screen showing `note`), true
+/// shows it again. Layout: type, pad, u16 visible, u16 note length, note
+/// (UTF-8, no NUL). The server answers with no message; the state shows in
+/// its next display info. Layout from rootshell-vnc (MIT).
+pub fn session_visibility(visible: bool, note: &str) -> Vec<u8> {
+    let mut end = note.len().min(CURTAIN_NOTE_MAX);
+    while !note.is_char_boundary(end) {
+        end -= 1;
+    }
+    let note = if visible { "" } else { &note[..end] };
+    let mut m = vec![12, 0];
+    m.extend_from_slice(&(visible as u16).to_be_bytes());
+    m.extend_from_slice(&(note.len() as u16).to_be_bytes());
+    m.extend_from_slice(note.as_bytes());
+    m
+}
+
 pub fn key_event(down: bool, keysym: u32) -> Vec<u8> {
     let mut m = vec![0x04, down as u8, 0, 0];
     m.extend_from_slice(&keysym.to_be_bytes());
@@ -287,6 +309,18 @@ pub fn parse_fbu(msg: &[u8]) -> Vec<Rect<'_>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn session_visibility_layout() {
+        assert_eq!(session_visibility(true, "ignored"), vec![12, 0, 0, 1, 0, 0]);
+        assert_eq!(session_visibility(false, "hi"), vec![12, 0, 0, 0, 0, 2, b'h', b'i']);
+        // Cut at the limit on a character boundary: 'é' is 2 bytes.
+        let long = "é".repeat(400);
+        let m = session_visibility(false, &long);
+        assert_eq!(u16::from_be_bytes([m[4], m[5]]) as usize, CURTAIN_NOTE_MAX);
+        assert!(std::str::from_utf8(&m[6..]).is_ok());
+    }
+
     use super::*;
 
     #[test]
