@@ -629,21 +629,50 @@ struct DecodeLoop {
     stats: DecodeStats,
     /// PIPPIN_DUMP_HEVC: every access unit fed to the decoder, as Annex B,
     /// for offline analysis (ffmpeg -bsf:v trace_headers) and benchmarks.
-    dump: Option<std::io::BufWriter<std::fs::File>>,
+    dump: Option<Dump>,
 }
 
-fn open_dump() -> Option<std::io::BufWriter<std::fs::File>> {
-    let path = std::env::var_os("PIPPIN_DUMP_HEVC")?;
-    match std::fs::File::create(&path) {
-        Ok(f) => {
-            tracing::info!("writing decoder input to {}", path.to_string_lossy());
-            Some(std::io::BufWriter::new(f))
+/// The decoder input dump, and an index next to it (the dump path with
+/// the extension `idx`): one line per access unit, `tile offset length
+/// time_us`, so a replay can tell the tiles apart and keep the timing.
+struct Dump {
+    data: std::io::BufWriter<std::fs::File>,
+    index: Option<std::io::BufWriter<std::fs::File>>,
+    offset: u64,
+    started: Instant,
+}
+
+impl Dump {
+    fn write(&mut self, tile: usize, annexb: &[u8]) {
+        use std::io::Write;
+        let _ = self.data.write_all(annexb);
+        if let Some(i) = self.index.as_mut() {
+            let us = self.started.elapsed().as_micros();
+            let _ = writeln!(i, "{tile} {} {} {us}", self.offset, annexb.len());
         }
+        self.offset += annexb.len() as u64;
+    }
+}
+
+fn open_dump() -> Option<Dump> {
+    let path = std::path::PathBuf::from(std::env::var_os("PIPPIN_DUMP_HEVC")?);
+    let data = match std::fs::File::create(&path) {
+        Ok(f) => std::io::BufWriter::new(f),
         Err(e) => {
             tracing::warn!("PIPPIN_DUMP_HEVC: {e}");
+            return None;
+        }
+    };
+    let index_path = path.with_extension("idx");
+    let index = match std::fs::File::create(&index_path) {
+        Ok(f) => Some(std::io::BufWriter::new(f)),
+        Err(e) => {
+            tracing::warn!("PIPPIN_DUMP_HEVC index {}: {e}", index_path.display());
             None
         }
-    }
+    };
+    tracing::info!("writing decoder input to {} (index {})", path.display(), index_path.display());
+    Some(Dump { data, index, offset: 0, started: Instant::now() })
 }
 
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -825,7 +854,7 @@ impl DecodeLoop {
         self.origin.insert(self.pts, (tile, au.donl, au.recovered, self.epoch, self.lossy));
         let mut pictures = Vec::new();
         if let Some(d) = self.dump.as_mut() {
-            let _ = std::io::Write::write_all(d, &annexb);
+            d.write(tile, &annexb);
         }
         let started = Instant::now();
         // Concealed pictures may still be in the decoder after the
