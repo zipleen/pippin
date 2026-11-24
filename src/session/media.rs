@@ -473,8 +473,15 @@ pub(super) fn ctrl_rx(
                     if let Some(data) = srtcp.unprotect(pkt) {
                         record_sender_reports(&shared, &data);
                     }
-                } else if let Some(a) = audio.as_mut() {
-                    a.packet(pkt);
+                } else {
+                    let m = &shared.metrics;
+                    m.audio_packets.fetch_add(1, Ordering::Relaxed);
+                    m.audio_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Some(a) = audio.as_mut()
+                        && a.packet(pkt)
+                    {
+                        m.audio_sound.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             Err(e) if is_timeout(&e) => {}
@@ -508,16 +515,17 @@ impl AudioRx {
         Ok(Self { srtp: SrtpReceiver::new(key), decoder, player, last_seq: None, failures: 0 })
     }
 
-    fn packet(&mut self, pkt: &[u8]) {
-        let Some(rtp) = self.srtp.unprotect(pkt) else { return };
+    /// Handles one packet; true when it decoded to sound (not silence).
+    fn packet(&mut self, pkt: &[u8]) -> bool {
+        let Some(rtp) = self.srtp.unprotect(pkt) else { return false };
         if rtp.pt != AUDIO_PT {
-            return;
+            return false;
         }
         if let Some(last) = self.last_seq {
             let gap = rtp.seq.wrapping_sub(last);
             if gap == 0 || gap > 0x8000 {
                 // Duplicate or late: already played past it.
-                return;
+                return false;
             }
             for _ in 1..gap.min(MAX_CONCEAL + 1) {
                 if let Ok(pcm) = self.decoder.conceal() {
@@ -527,7 +535,11 @@ impl AudioRx {
         }
         self.last_seq = Some(rtp.seq);
         match self.decoder.decode(&rtp.payload) {
-            Ok(pcm) => self.player.push(pcm),
+            Ok(pcm) => {
+                let sound = pcm.iter().any(|&s| s != 0);
+                self.player.push(pcm);
+                sound
+            }
             Err(e) => {
                 self.failures += 1;
                 if self.failures == 1 {
@@ -535,6 +547,7 @@ impl AudioRx {
                 } else {
                     tracing::trace!("audio decode failed: {e:#}");
                 }
+                false
             }
         }
     }

@@ -144,6 +144,11 @@ pub(super) struct Metrics {
     pub decode_ns: AtomicU64,
     pub decode_worst_ns: AtomicU64,
     pub presented: AtomicU64,
+    /// Packets on the audio port that are not RTCP (the host's sound), their
+    /// bytes, and decoded packets that held sound (not digital silence).
+    pub audio_packets: AtomicU64,
+    pub audio_bytes: AtomicU64,
+    pub audio_sound: AtomicU64,
     pub awaiting_idr: AtomicBool,
     concealed_pictures: AtomicU64,
     recovery_dropped: AtomicU64,
@@ -487,6 +492,13 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
         if aus == 0 { "null".into() } else { ms(worst) },
         rate(take(&m.presented)),
     );
+    let _ = write!(
+        s,
+        ",\"audio_pps\":{},\"audio_bytes_ps\":{},\"audio_sound_ps\":{}",
+        rate(take(&m.audio_packets)),
+        rate(take(&m.audio_bytes)),
+        rate(take(&m.audio_sound)),
+    );
     match cx.rtt {
         Some(r) => {
             let _ = write!(s, ",\"rtt_ms\":{}}}", ms(r));
@@ -716,6 +728,9 @@ mod tests {
         m.shown(true);
         m.shown(false);
         m.set_decoder("vaapi");
+        m.audio_packets.store(4, Ordering::Relaxed);
+        m.audio_bytes.store(200, Ordering::Relaxed);
+        m.audio_sound.store(1, Ordering::Relaxed);
         let op = op();
         let tiles = [
             TileLine { loss_pct: 1.0, loss_pre_pct: 3.0, jitter_ms: 2.5, fps: 29.5 },
@@ -748,7 +763,8 @@ mod tests {
              \"kf_reoffer\":0,\"kf_stall\":0,\"kf_hw_fallback\":0,\"kf_other\":0,\"kf_suppressed\":0,\
              \"irap_aus\":0,\"irap_bytes\":0,\"irap_follow_bytes\":0,\"recovery_n\":0,\
              \"recovery_p50_ms\":null,\"recovery_max_ms\":null,\"recovery_dropped\":0,\"frozen_ms\":30,\"concealed_ms\":40,\"concealed_pictures\":1,\"decode_aus\":1,\
-             \"decode_avg_ms\":3.0,\"decode_worst_ms\":3.0,\"presented_fps\":0.0,\"rtt_ms\":null}"
+             \"decode_avg_ms\":3.0,\"decode_worst_ms\":3.0,\"presented_fps\":0.0,\"audio_pps\":2.0,\
+             \"audio_bytes_ps\":100.0,\"audio_sound_ps\":0.5,\"rtt_ms\":null}"
         );
         // Counters were consumed.
         let again = line(&m, &context(&op, &[]));
