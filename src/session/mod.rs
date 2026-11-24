@@ -225,6 +225,9 @@ pub struct Shared {
     /// since the video receiver last logged it.
     recovered_damaged: AtomicU32,
     canvas: Mutex<Option<(u32, u32)>>,
+    /// DisplayInfo2 screen flags from the host (`SessionFlags`); bit 31 set
+    /// once known.
+    session_flags: AtomicU32,
     /// The control connection while the handshake runs, for shutdown().
     connecting: Mutex<Option<TcpStream>>,
     /// Clones of the media sockets, so shutdown() can wake their readers.
@@ -253,6 +256,20 @@ impl Shared {
 
     fn op_handle(&self) -> &SharedOp {
         &self.op
+    }
+
+    /// Keeps the host's DisplayInfo2 screen flags; logs when they change.
+    fn set_session_flags(&self, flags: u32) {
+        use crate::proto::messages::SessionFlags;
+        let new = flags | 1 << 31;
+        if self.session_flags.swap(new, Ordering::Relaxed) != new {
+            tracing::info!(
+                "host session: curtain {} ({}), login window {}",
+                if flags & SessionFlags::ON_CONSOLE != 0 { "off" } else { "on" },
+                if flags & SessionFlags::CURTAIN_AVAILABLE != 0 { "can be changed" } else { "cannot be changed" },
+                flags & (SessionFlags::LOGIN_WINDOW | SessionFlags::LOCK_SCREEN) != 0,
+            );
+        }
     }
 
     fn set_canvas(&self, w: u32, h: u32) {
@@ -291,6 +308,7 @@ impl Session {
             rtt: Mutex::new(None),
             recovered_damaged: AtomicU32::new(0),
             canvas: Mutex::new(None),
+            session_flags: AtomicU32::new(0),
             connecting: Mutex::new(None),
             udp: Mutex::new(Vec::new()),
             op: cfg.op.clone(),
@@ -371,6 +389,27 @@ impl Session {
             );
             c.send(&messages::set_display_configuration(&req));
         }
+        true
+    }
+
+    /// The host's DisplayInfo2 screen flags (`proto::messages::SessionFlags`),
+    /// once it sent them: whether curtain mode can be changed, and whether
+    /// the session is on the Mac's own display.
+    pub fn session_flags(&self) -> Option<u32> {
+        let f = self.shared.session_flags.load(Ordering::Relaxed);
+        (f & 1 << 31 != 0).then_some(f & 0xff)
+    }
+
+    /// Asks the host for several virtual displays (see
+    /// [`messages::set_display_configurations`]). Returns false, sending
+    /// nothing, while the session is still connecting.
+    pub fn resize_displays(&self, reqs: &[DisplayRequest]) -> bool {
+        let Some(c) = self.control() else { return false };
+        for (i, r) in reqs.iter().enumerate() {
+            tracing::info!("requesting display {}: {}x{} @{}x (backing {:?})", i + 1, r.width, r.height, r.scale,
+                r.backing());
+        }
+        c.send(&messages::set_display_configurations(reqs));
         true
     }
 

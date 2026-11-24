@@ -70,6 +70,10 @@ pub struct DisplayRequest {
     pub scale: f64,
 }
 
+/// Attributes of the virtual displays we ask for (offset 0x7E of a display
+/// info): 4 is what Screen Sharing.app sends.
+static DISPLAY_ATTRIBUTES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(4);
+
 static MAX_BACKING_W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(3840);
 static MAX_BACKING_H: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2160);
 
@@ -87,6 +91,14 @@ impl DisplayRequest {
         use std::sync::atomic::Ordering::Relaxed;
         MAX_BACKING_W.store(width.max(1), Relaxed);
         MAX_BACKING_H.store(height.max(1), Relaxed);
+    }
+
+    /// Changes the attributes field of the virtual displays asked for, for
+    /// the whole process (default 4, as Screen Sharing.app). rootshell-vnc
+    /// sends 0. What each bit does is not documented; 4 may make the
+    /// virtual display replace the Mac's own display (not verified).
+    pub fn set_display_attributes(attributes: u32) {
+        DISPLAY_ATTRIBUTES.store(attributes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The backing-store cap in use (see [`set_max_backing`](Self::set_max_backing)).
@@ -124,10 +136,37 @@ impl DisplayRequest {
 /// 0x1d SetDisplayConfiguration. Used for the initial virtual display and,
 /// identically, for mid-session dynamic resolution changes.
 pub fn set_display_configuration(req: &DisplayRequest) -> Vec<u8> {
-    display_configuration_capped(req, DisplayRequest::max_backing())
+    display_configuration_capped(std::slice::from_ref(req), DisplayRequest::max_backing())
 }
 
-fn display_configuration_capped(req: &DisplayRequest, (max_w, max_h): (u32, u32)) -> Vec<u8> {
+/// SetDisplayConfiguration for several virtual displays at once (the
+/// message has a display count). With one display it is the same message as
+/// [`set_display_configuration`]. Whether a host makes more than one virtual
+/// display in a High Performance session is not known.
+pub fn set_display_configurations(reqs: &[DisplayRequest]) -> Vec<u8> {
+    display_configuration_capped(reqs, DisplayRequest::max_backing())
+}
+
+fn display_configuration_capped(reqs: &[DisplayRequest], cap: (u32, u32)) -> Vec<u8> {
+    let attributes = DISPLAY_ATTRIBUTES.load(std::sync::atomic::Ordering::Relaxed);
+    let infos: Vec<Vec<u8>> =
+        reqs.iter().enumerate().map(|(i, r)| display_info(r, cap, i, attributes)).collect();
+    let body: usize = infos.iter().map(Vec::len).sum();
+    let mut msg = vec![0x1d, 0];
+    msg.extend_from_slice(&((8 + body) as u16).to_be_bytes());
+    msg.extend_from_slice(&1u16.to_be_bytes()); // version
+    msg.extend_from_slice(&(reqs.len() as u16).to_be_bytes()); // display count
+    msg.extend_from_slice(&0u32.to_be_bytes()); // flags
+    for di in infos {
+        msg.extend_from_slice(&di);
+    }
+    msg
+}
+
+/// One display's info block. Display `index` gets its own name, identifier
+/// (7 + index) and origin (right of the ones before it), as rootshell-vnc
+/// (MIT) does for two virtual displays.
+fn display_info(req: &DisplayRequest, (max_w, max_h): (u32, u32), index: usize, attributes: u32) -> Vec<u8> {
     const MODES: [(f64, f64); 5] =
         [(1920.0, 1080.0), (1440.0, 900.0), (1920.0, 1080.0), (1440.0, 810.0), (1312.0, 848.0)];
     let mode_count = MODES.len();
@@ -137,17 +176,20 @@ fn display_configuration_capped(req: &DisplayRequest, (max_w, max_h): (u32, u32)
     let put32 = |d: &mut [u8], off: usize, v: u32| d[off..off + 4].copy_from_slice(&v.to_be_bytes());
 
     put16(&mut di, 0, di_size as u16);
-    let name = b"pippin Virtual Display";
-    di[2..2 + name.len()].copy_from_slice(name);
+    let name = match index {
+        0 => "pippin Virtual Display".to_owned(),
+        i => format!("pippin Virtual Display {}", i + 1),
+    };
+    di[2..2 + name.len()].copy_from_slice(name.as_bytes());
     put32(&mut di, 0x7A, 1); // dynamic resolution
-    put32(&mut di, 0x7E, 4); // virtual display
+    put32(&mut di, 0x7E, attributes);
     di[0x82..0x86].copy_from_slice(&369.454_56_f32.to_be_bytes());
     di[0x86..0x8A].copy_from_slice(&207.818_17_f32.to_be_bytes());
     put32(&mut di, 0x8A, max_w);
     put32(&mut di, 0x8E, max_h);
-    put16(&mut di, 0x92, 0);
+    put16(&mut di, 0x92, (req.backing().0 as usize * index).min(u16::MAX as usize) as u16); // origin x
     put16(&mut di, 0x94, 0);
-    put32(&mut di, 0x96, 7);
+    put32(&mut di, 0x96, 7 + index as u32); // identifier
     put16(&mut di, 0x9A, mode_count as u16);
 
     let sx = req.width as f64 / 1920.0;
@@ -165,14 +207,7 @@ fn display_configuration_capped(req: &DisplayRequest, (max_w, max_h): (u32, u32)
         di[m + 16..m + 24].copy_from_slice(&60.0f64.to_be_bytes());
         put32(&mut di, m + 24, 0);
     }
-
-    let mut msg = vec![0x1d, 0];
-    msg.extend_from_slice(&((8 + di_size) as u16).to_be_bytes());
-    msg.extend_from_slice(&1u16.to_be_bytes()); // version
-    msg.extend_from_slice(&1u16.to_be_bytes()); // display count
-    msg.extend_from_slice(&0u32.to_be_bytes()); // flags
-    msg.extend_from_slice(&di);
-    msg
+    di
 }
 
 pub fn fbu_request(incremental: bool, x: u16, y: u16, w: u16, h: u16) -> Vec<u8> {
@@ -252,6 +287,41 @@ pub struct DisplayLayout {
     pub scaled: (u16, u16),
     pub backing: (u16, u16),
     pub displays: Vec<DisplayRect>,
+    /// DisplayInfo2 screen flags (see [`SessionFlags`]), if found.
+    pub session_flags: Option<u32>,
+}
+
+/// DisplayInfo2 screen flags, as rootshell-vnc (MIT) reads them.
+pub struct SessionFlags;
+
+impl SessionFlags {
+    /// The host accepts curtain commands.
+    pub const CURTAIN_AVAILABLE: u32 = 0x02;
+    /// The session is drawn on the Mac's own display (not curtained).
+    pub const ON_CONSOLE: u32 = 0x04;
+    pub const LOCK_SCREEN: u32 = 0x08;
+    pub const LOGIN_WINDOW: u32 = 0x10;
+}
+
+/// The screen flags of a DisplayInfo2 payload. macOS has sent them in both
+/// byte orders; the defined bits are in the low byte, so both readings are
+/// combined (as rootshell-vnc does). With a two-byte length prefix the
+/// version is at 2 and the flags at 16, else at 0 and 14.
+fn session_flags(p: &[u8]) -> Option<u32> {
+    let version_ok = |off: usize| {
+        let (be, le) = (p.get(off..off + 2)?, p.get(off..off + 2)?);
+        let (be, le) = (u16::from_be_bytes([be[0], be[1]]), u16::from_le_bytes([le[0], le[1]]));
+        ((4..=16).contains(&be) || (4..=16).contains(&le)).then_some(())
+    };
+    let at = if p.len() >= 20 && version_ok(2).is_some() {
+        16
+    } else if version_ok(0).is_some() {
+        14
+    } else {
+        return None;
+    };
+    let b: [u8; 4] = p.get(at..at + 4)?.try_into().ok()?;
+    Some((u32::from_be_bytes(b) | u32::from_le_bytes(b)) & 0xff)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -284,7 +354,7 @@ fn parse_layout(p: &[u8]) -> Option<DisplayLayout> {
             }
         }
     }
-    Some(DisplayLayout { scaled, backing, displays })
+    Some(DisplayLayout { scaled, backing, displays, session_flags: session_flags(p) })
 }
 
 /// Walks a FramebufferUpdate (type 0x00). Stops at the first rect whose
@@ -348,10 +418,38 @@ mod tests {
         assert_eq!(r.backing(), (3840, 1080), "fits the default cap");
         let r = DisplayRequest::for_pixels_capped(7680, 2160, 2.0, (7680, 2160));
         assert_eq!(r.backing(), (7680, 2160));
-        let m = display_configuration_capped(&r, (7680, 2160));
+        let m = display_configuration_capped(&[r], (7680, 2160));
         // Header 12 bytes (type, pad, length, version, count, flags), then the display info: the cap at 0x8A and 0x8E.
         assert_eq!(u32::from_be_bytes(m[12 + 0x8A..12 + 0x8E].try_into().unwrap()), 7680);
         assert_eq!(u32::from_be_bytes(m[12 + 0x8E..12 + 0x92].try_into().unwrap()), 2160);
+    }
+
+    #[test]
+    fn session_flags_in_both_byte_orders() {
+        let mut p = vec![0u8; 24];
+        p[2..4].copy_from_slice(&5u16.to_be_bytes()); // version 5, prefixed form
+        p[16..20].copy_from_slice(&(SessionFlags::CURTAIN_AVAILABLE | SessionFlags::ON_CONSOLE).to_be_bytes());
+        assert_eq!(session_flags(&p), Some(0x06));
+        p[16..20].copy_from_slice(&SessionFlags::CURTAIN_AVAILABLE.to_le_bytes());
+        assert_eq!(session_flags(&p), Some(0x02));
+        assert_eq!(session_flags(&[0u8; 6]), None, "no version: unknown");
+    }
+
+    #[test]
+    fn two_displays_in_one_message() {
+        let r = DisplayRequest::for_pixels(3840, 2160, 2.0);
+        let one = set_display_configuration(&r);
+        assert_eq!(set_display_configurations(&[r]), one, "one display: the same message");
+        let two = set_display_configurations(&[r, r]);
+        let di = one.len() - 12;
+        assert_eq!(two.len(), 12 + 2 * di);
+        assert_eq!(u16::from_be_bytes([two[2], two[3]]) as usize, 8 + 2 * di, "length");
+        assert_eq!(u16::from_be_bytes([two[6], two[7]]), 2, "display count");
+        let second = &two[12 + di..];
+        assert_eq!(&second[2..2 + 24], b"pippin Virtual Display 2");
+        assert_eq!(u16::from_be_bytes([second[0x92], second[0x93]]), 3840, "right of the first");
+        assert_eq!(u32::from_be_bytes(second[0x96..0x9A].try_into().unwrap()), 8, "own identifier");
+        assert_eq!(u32::from_be_bytes(two[12 + 0x7E..12 + 0x82].try_into().unwrap()), 4, "default attributes");
     }
 
     #[test]

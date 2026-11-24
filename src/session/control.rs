@@ -192,6 +192,9 @@ impl ControlReader {
             l.backing.1,
             l.displays.len()
         );
+        if let Some(f) = l.session_flags {
+            self.shared.set_session_flags(f);
+        }
         // Re-arm the cursor sender at every layout transition.
         self.control.send(&messages::fbu_request(false, 0, 0, 0xffff, 0xffff));
         if l.backing.0 == 0 || l.backing.1 == 0 {
