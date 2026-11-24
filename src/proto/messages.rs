@@ -70,14 +70,40 @@ pub struct DisplayRequest {
     pub scale: f64,
 }
 
+static MAX_BACKING_W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(3840);
+static MAX_BACKING_H: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2160);
+
 impl DisplayRequest {
+    /// Default backing-store cap.
     pub const MAX_BACKING: (u32, u32) = (3840, 2160);
 
+    /// Changes the backing-store cap for the whole process: what
+    /// [`for_pixels`](Self::for_pixels) fits into and what
+    /// SetDisplayConfiguration offers the host (default
+    /// [`MAX_BACKING`](Self::MAX_BACKING)). For a wider virtual display,
+    /// e.g. 7680x2160; whether a host accepts more than 3840x2160 is
+    /// not known.
+    pub fn set_max_backing(width: u32, height: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        MAX_BACKING_W.store(width.max(1), Relaxed);
+        MAX_BACKING_H.store(height.max(1), Relaxed);
+    }
+
+    /// The backing-store cap in use (see [`set_max_backing`](Self::set_max_backing)).
+    pub fn max_backing() -> (u32, u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (MAX_BACKING_W.load(Relaxed), MAX_BACKING_H.load(Relaxed))
+    }
+
     /// Picks the logical size and scale so the host's backing store matches
-    /// `pixels` as closely as its 3840×2160 cap allows.
+    /// `pixels` as closely as the cap allows (3840×2160 unless changed with
+    /// [`set_max_backing`](Self::set_max_backing)).
     pub fn for_pixels(px_w: u32, px_h: u32, scale: f64) -> Self {
+        Self::for_pixels_capped(px_w, px_h, scale, Self::max_backing())
+    }
+
+    fn for_pixels_capped(px_w: u32, px_h: u32, scale: f64, (max_w, max_h): (u32, u32)) -> Self {
         let scale = scale.clamp(0.5, 3.0);
-        let (max_w, max_h) = Self::MAX_BACKING;
         let fit = (max_w as f64 / px_w.max(1) as f64)
             .min(max_h as f64 / px_h.max(1) as f64)
             .min(1.0);
@@ -98,6 +124,10 @@ impl DisplayRequest {
 /// 0x1d SetDisplayConfiguration. Used for the initial virtual display and,
 /// identically, for mid-session dynamic resolution changes.
 pub fn set_display_configuration(req: &DisplayRequest) -> Vec<u8> {
+    display_configuration_capped(req, DisplayRequest::max_backing())
+}
+
+fn display_configuration_capped(req: &DisplayRequest, (max_w, max_h): (u32, u32)) -> Vec<u8> {
     const MODES: [(f64, f64); 5] =
         [(1920.0, 1080.0), (1440.0, 900.0), (1920.0, 1080.0), (1440.0, 810.0), (1312.0, 848.0)];
     let mode_count = MODES.len();
@@ -113,8 +143,8 @@ pub fn set_display_configuration(req: &DisplayRequest) -> Vec<u8> {
     put32(&mut di, 0x7E, 4); // virtual display
     di[0x82..0x86].copy_from_slice(&369.454_56_f32.to_be_bytes());
     di[0x86..0x8A].copy_from_slice(&207.818_17_f32.to_be_bytes());
-    put32(&mut di, 0x8A, DisplayRequest::MAX_BACKING.0);
-    put32(&mut di, 0x8E, DisplayRequest::MAX_BACKING.1);
+    put32(&mut di, 0x8A, max_w);
+    put32(&mut di, 0x8E, max_h);
     put16(&mut di, 0x92, 0);
     put16(&mut di, 0x94, 0);
     put32(&mut di, 0x96, 7);
@@ -309,6 +339,20 @@ pub fn parse_fbu(msg: &[u8]) -> Vec<Rect<'_>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn max_backing_can_be_raised() {
+        // The capped forms, so the process-wide cap is never changed under other tests.
+        assert_eq!(DisplayRequest::max_backing(), DisplayRequest::MAX_BACKING);
+        let r = DisplayRequest::for_pixels(7680, 2160, 2.0);
+        assert_eq!(r.backing(), (3840, 1080), "fits the default cap");
+        let r = DisplayRequest::for_pixels_capped(7680, 2160, 2.0, (7680, 2160));
+        assert_eq!(r.backing(), (7680, 2160));
+        let m = display_configuration_capped(&r, (7680, 2160));
+        // Header 12 bytes (type, pad, length, version, count, flags), then the display info: the cap at 0x8A and 0x8E.
+        assert_eq!(u32::from_be_bytes(m[12 + 0x8A..12 + 0x8E].try_into().unwrap()), 7680);
+        assert_eq!(u32::from_be_bytes(m[12 + 0x8E..12 + 0x92].try_into().unwrap()), 2160);
+    }
 
     #[test]
     fn session_visibility_layout() {
