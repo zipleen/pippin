@@ -234,11 +234,80 @@ pub struct Shared {
     udp: Mutex<Vec<UdpSocket>>,
     op: SharedOp,
     metrics: metrics::Metrics,
+    /// Display 2's stream state; the session it belongs to stops it.
+    parent: Option<Arc<Shared>>,
+    /// Our video SSRC for this stream's RTCP (round trips); `None`: the
+    /// control's (the first stream).
+    own_ssrc: Option<u32>,
+    /// With two virtual displays: the second display's video stream.
+    second: OnceLock<SecondStream>,
+}
+
+/// The second display's video stream: its own receive, decode and feedback
+/// threads and frame store, on the next UDP port.
+pub(crate) struct SecondStream {
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) feedback: Sender<Feedback>,
+}
+
+/// Passes on what display 2's stream reports: new pictures and a decoder
+/// that cannot go on. The rest (canvas, cursor) comes from the first.
+struct SecondSink(Arc<dyn EventSink>);
+
+impl EventSink for SecondSink {
+    fn emit(&self, event: Event) {
+        if matches!(event, Event::Frame | Event::Closed(_)) {
+            self.0.emit(event);
+        }
+    }
 }
 
 impl Shared {
+    fn new(sink: Arc<dyn EventSink>, op: SharedOp, parent: Option<Arc<Shared>>, own_ssrc: Option<u32>) -> Self {
+        Shared {
+            clock: Clock(Instant::now()),
+            stop: AtomicBool::new(false),
+            control: OnceLock::new(),
+            sink,
+            frames: Arc::new(FrameStore::default()),
+            tiles: AtomicU32::new(crate::proto::offers::TILES_PER_FRAME as u32),
+            last_video_packet: AtomicU64::new(0),
+            last_frame: AtomicU64::new(0),
+            renegotiated: AtomicU64::new(0),
+            tile_ssrcs: Mutex::new(Vec::new()),
+            rx_stats: Mutex::new(HashMap::new()),
+            sender_reports: Mutex::new(HashMap::new()),
+            rtt: Mutex::new(None),
+            recovered_damaged: AtomicU32::new(0),
+            canvas: Mutex::new(None),
+            session_flags: AtomicU32::new(0),
+            connecting: Mutex::new(None),
+            udp: Mutex::new(Vec::new()),
+            op,
+            metrics: metrics::Metrics::default(),
+            parent,
+            own_ssrc,
+            second: OnceLock::new(),
+        }
+    }
+
     fn stopped(&self) -> bool {
-        self.stop.load(Ordering::Acquire)
+        self.stop.load(Ordering::Acquire) || self.parent.as_ref().is_some_and(|p| p.stopped())
+    }
+
+    /// The SSRC our RTCP for this stream is sent as.
+    pub(crate) fn our_video_ssrc(&self) -> Option<u32> {
+        self.own_ssrc.or_else(|| self.control.get().map(|c| c.video_ssrc))
+    }
+
+    /// This is display 2's stream state.
+    pub(crate) fn is_second(&self) -> bool {
+        self.parent.is_some()
+    }
+
+    /// The second display's stream, with two virtual displays.
+    pub(crate) fn second(&self) -> Option<&SecondStream> {
+        self.second.get()
     }
 
     fn since_ms(&self, stamp: &AtomicU64) -> u64 {
@@ -292,28 +361,18 @@ impl Session {
     /// Starts connecting in the background. Progress and failures arrive as
     /// [`Event`]s.
     pub fn start(cfg: Config, display: DisplayRequest, sink: Arc<dyn EventSink>) -> Self {
-        let shared = Arc::new(Shared {
-            clock: Clock(Instant::now()),
-            stop: AtomicBool::new(false),
-            control: OnceLock::new(),
-            sink,
-            frames: Arc::new(FrameStore::default()),
-            tiles: AtomicU32::new(crate::proto::offers::TILES_PER_FRAME as u32),
-            last_video_packet: AtomicU64::new(0),
-            last_frame: AtomicU64::new(0),
-            renegotiated: AtomicU64::new(0),
-            tile_ssrcs: Mutex::new(Vec::new()),
-            rx_stats: Mutex::new(HashMap::new()),
-            sender_reports: Mutex::new(HashMap::new()),
-            rtt: Mutex::new(None),
-            recovered_damaged: AtomicU32::new(0),
-            canvas: Mutex::new(None),
-            session_flags: AtomicU32::new(0),
-            connecting: Mutex::new(None),
-            udp: Mutex::new(Vec::new()),
-            op: cfg.op.clone(),
-            metrics: metrics::Metrics::default(),
-        });
+        Self::start_displays(cfg, display, 1, sink)
+    }
+
+    /// Like [`start`](Self::start), with `displays` virtual displays of
+    /// `display` each (1 or 2). With 2 the host makes two displays side by
+    /// side, as for Apple's "two virtual displays" (High Performance), and
+    /// sends one video stream per display: the second on UDP port + 2, its
+    /// pictures in [`display_frames(1)`](Self::display_frames). The canvas
+    /// ([`Event::Canvas`]) is both displays, side by side.
+    pub fn start_displays(cfg: Config, display: DisplayRequest, displays: usize, sink: Arc<dyn EventSink>) -> Self {
+        let displays = displays.clamp(1, 2);
+        let shared = Arc::new(Shared::new(sink, cfg.op.clone(), None, None));
         let threads = Arc::new(Mutex::new(Vec::new()));
         let session = Session { shared: shared.clone(), threads: threads.clone() };
         let main = thread::Builder::new()
@@ -323,7 +382,7 @@ impl Session {
                 // A session shut down while still connecting may hold the
                 // UDP ports until its handshake gives up; wait for it.
                 join_detached();
-                let result = run(cfg, display, shared.clone(), &threads);
+                let result = run(cfg, display, displays, shared.clone(), &threads);
                 if !shared.stopped() {
                     // The reader only returns Ok once stopped; treat anything
                     // else like a clean close by the host.
@@ -342,6 +401,17 @@ impl Session {
 
     pub fn frames(&self) -> &FrameStore {
         &self.shared.frames
+    }
+
+    /// The pictures of display `index` (0: the first, the same as
+    /// [`frames`](Self::frames); 1: the second of two virtual displays,
+    /// once its stream is set up). [`Event::Frame`] is sent for both.
+    pub fn display_frames(&self, index: usize) -> Option<&FrameStore> {
+        match index {
+            0 => Some(&self.shared.frames),
+            1 => self.shared.second().map(|s| &*s.shared.frames),
+            _ => None,
+        }
     }
 
     pub fn decoder(&self) -> &'static str {
@@ -522,16 +592,29 @@ fn spawn(threads: &Mutex<Vec<JoinHandle<()>>>, name: &str, f: impl FnOnce() + Se
     threads.lock().push(t);
 }
 
-fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mutex<Vec<JoinHandle<()>>>) -> Result<()> {
+fn run(
+    cfg: Config,
+    display: DisplayRequest,
+    displays: usize,
+    shared: Arc<Shared>,
+    threads: &Mutex<Vec<JoinHandle<()>>>,
+) -> Result<()> {
     let addr = SocketAddrV4::new(cfg.host, cfg.port);
     let ctrl_dest = SocketAddrV4::new(cfg.host, cfg.port);
     let video_dest = SocketAddrV4::new(cfg.host, cfg.port + 1);
+    // The second display's video: the port after the first's (the host
+    // offers 5901 and 5902; seen in Apple's viewer).
+    let video2_dest = SocketAddrV4::new(cfg.host, cfg.port + 2);
 
     // The media burst starts right after the answer, so the UDP sockets
     // must exist before the handshake.
     let ctrl_sock = bind_udp(cfg.port)?;
     let video_sock = bind_udp(cfg.port + 1)?;
+    let video2_sock = if displays > 1 { Some(bind_udp(cfg.port + 2)?) } else { None };
     shared.udp.lock().extend([ctrl_sock.try_clone()?, video_sock.try_clone()?]);
+    if let Some(s) = &video2_sock {
+        shared.udp.lock().push(s.try_clone()?);
+    }
     if shared.stopped() {
         // shutdown() may have closed the list before we filled it.
         return Ok(());
@@ -550,10 +633,14 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     let punching = Arc::new(AtomicBool::new(true));
     let punch = {
         let (c, v, flag) = (ctrl_sock.try_clone()?, video_sock.try_clone()?, punching.clone());
+        let v2 = video2_sock.as_ref().map(UdpSocket::try_clone).transpose()?;
         thread::spawn(move || {
             while flag.load(Ordering::Relaxed) {
                 let _ = c.send_to(&[0], ctrl_dest);
                 let _ = v.send_to(&[0], video_dest);
+                if let Some(v2) = &v2 {
+                    let _ = v2.send_to(&[0], video2_dest);
+                }
                 thread::sleep(Duration::from_millis(100));
             }
         })
@@ -564,6 +651,7 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         password: cfg.password.clone(),
         session_mode: cfg.session_mode,
         display,
+        displays,
         audio: cfg.audio.is_some(),
         offer: shared.op().offer_options(),
         on_open: Some(Box::new({
@@ -607,7 +695,11 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         if c.tiles > 0 {
             shared.tiles.store(c.tiles, Ordering::Relaxed);
         }
-        shared.set_canvas(c.width, c.height);
+        // With two displays the canvas is both side by side: it comes with
+        // the display layout, not with the first display's answer.
+        if displays == 1 {
+            shared.set_canvas(c.width, c.height);
+        }
         shared.metrics.set_answer_ltrp(c.ltrp);
     }
     // We write to the host every tick (cursor poll), so a host that went to
@@ -633,6 +725,43 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     let (fb_tx, fb_rx): (Sender<Feedback>, Receiver<Feedback>) = crossbeam_channel::unbounded();
     let (dec_tx, dec_rx) = crossbeam_channel::bounded(256);
     let (clip_tx, clip_rx) = crossbeam_channel::unbounded();
+    let decoder_opts = crate::video::decoder::DecoderOptions {
+        kind: cfg.decoder,
+        threads: cfg.decode_threads,
+        vaapi_device: cfg.vaapi_device.clone(),
+    };
+
+    // Display 2: the same threads as display 1 below (no audio, no control
+    // messages), with the second stream's keys and socket. Its RTCP goes
+    // out on its own port, as Apple's viewer does it for each display.
+    if let (Some(sock), Some(v2)) = (video2_sock, neg.offer.video2.clone()) {
+        let sink: Arc<dyn EventSink> = Arc::new(SecondSink(shared.sink.clone()));
+        let second = Arc::new(Shared::new(sink, shared.op.clone(), Some(shared.clone()), Some(v2.ssrc)));
+        let _ = second.control.set(control.clone());
+        let (fb_tx2, fb_rx2) = crossbeam_channel::unbounded();
+        let (dec_tx2, dec_rx2) = crossbeam_channel::bounded(256);
+        {
+            let (sh, fb, sock, dec) = (second.clone(), fb_tx2.clone(), sock.try_clone()?, dec_tx2.clone());
+            spawn(threads, "video2-rx", move || media::video_rx(sh, sock, v2.key_s, dec, fb));
+        }
+        {
+            let (sh, fb, opts, sync) = (second.clone(), fb_tx2.clone(), decoder_opts.clone(), cfg.sync_tiles);
+            spawn(threads, "decoder2", move || media::decoder(sh, dec_rx2, fb, opts, sync));
+        }
+        {
+            let sh = second.clone();
+            let sockets = media::FeedbackSockets {
+                ctrl: sock.try_clone()?,
+                video: sock,
+                ctrl_dest: video2_dest,
+                video_dest: video2_dest,
+            };
+            let keys = media::FeedbackKeys::second(&v2);
+            spawn(threads, "feedback2", move || media::feedback(sh, sockets, keys, fb_rx2, dec_tx2));
+        }
+        tracing::info!("display 2: video stream on UDP port {}", cfg.port + 2);
+        let _ = shared.second.set(SecondStream { shared: second, feedback: fb_tx2 });
+    }
 
     {
         let (shared, fb, sock) = (shared.clone(), fb_tx.clone(), video_sock.try_clone()?);
@@ -641,11 +770,7 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     }
     {
         let (shared, fb) = (shared.clone(), fb_tx.clone());
-        let opts = crate::video::decoder::DecoderOptions {
-            kind: cfg.decoder,
-            threads: cfg.decode_threads,
-            vaapi_device: cfg.vaapi_device.clone(),
-        };
+        let opts = decoder_opts;
         let sync = cfg.sync_tiles;
         spawn(threads, "decoder", move || media::decoder(shared, dec_rx, fb, opts, sync));
     }
@@ -658,8 +783,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     {
         let shared = shared.clone();
         let sockets = media::FeedbackSockets { ctrl: ctrl_sock, video: video_sock, ctrl_dest, video_dest };
-        let offer = neg.offer.clone();
-        spawn(threads, "feedback", move || media::feedback(shared, sockets, offer, fb_rx, dec_tx));
+        let keys = media::FeedbackKeys::first(&neg.offer);
+        spawn(threads, "feedback", move || media::feedback(shared, sockets, keys, fb_rx, dec_tx));
     }
     {
         let (shared, control) = (shared.clone(), control.clone());

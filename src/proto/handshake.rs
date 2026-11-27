@@ -37,6 +37,9 @@ pub struct ConnectParams {
     pub password: String,
     pub session_mode: SessionMode,
     pub display: DisplayRequest,
+    /// 2: two virtual displays of `display` each, side by side, with one
+    /// video stream each (as Apple's viewer). 1: one display.
+    pub displays: usize,
     pub audio: bool,
     pub offer: OfferOptions,
     /// Shown each control connection as soon as it's open, so the caller
@@ -300,7 +303,21 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
 
     s.write_all(&messages::viewer_info())?;
     std::thread::sleep(Duration::from_millis(100));
-    s.write_all(&messages::set_display_configuration(&p.display))?;
+    if p.displays > 1 {
+        // Apple's viewer asks for its displays here, before SetEncodings, so
+        // the host makes them (about 2 s) before it offers the video.
+        tracing::info!(
+            "asking for {} virtual displays of {}x{} pixels ({}x{} points)",
+            p.displays,
+            p.display.backing().0,
+            p.display.backing().1,
+            p.display.width,
+            p.display.height
+        );
+        s.write_all(&messages::set_display_configurations(&vec![p.display; p.displays]))?;
+    } else {
+        s.write_all(&messages::set_display_configuration(&p.display))?;
+    }
     s.write_all(&messages::set_encodings())?;
 
     let keys = read_record_keys(&mut s, &auth_key).map_err(|e| {
@@ -320,7 +337,10 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
     std::thread::sleep(Duration::from_millis(200));
     tracing::debug!("record layer active");
 
-    let offer = MediaOffer::generate(p.audio, p.session_mode == SessionMode::Alt, p.offer);
+    let mut offer = MediaOffer::generate(p.audio, p.session_mode == SessionMode::Alt, p.offer);
+    if p.displays > 1 {
+        offer = offer.with_second_video();
+    }
     let offer_msg = offer.message();
     for m in [messages::set_encodings(), offer_msg.clone(), messages::fbu_request(false, 0, 0, 0xffff, 0xffff)] {
         s.write_all(&sealer.seal(&m))?;
@@ -350,6 +370,13 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
         match (msg.first(), parse_answer(&msg)) {
             (Some(0x00), Some(c)) if !c.is_degenerate() => {
                 tracing::info!("encoder canvas {}x{} in {} tiles", c.width, c.height, c.tiles);
+                if offer.video2.is_some() {
+                    let all = super::offers::parse_answers(&msg);
+                    tracing::info!(
+                        "video answers: {}",
+                        all.iter().map(|c| format!("{}x{}/{}", c.width, c.height, c.tiles)).collect::<Vec<_>>().join(", ")
+                    );
+                }
                 canvas = Some(c);
                 break;
             }

@@ -12,7 +12,7 @@ use crossbeam_channel::Sender;
 use super::{Control, CursorShape, Event, Feedback, KeyframeCause, Shared};
 use crate::proto::clipboard::{self, Reassembler};
 use crate::proto::messages::{self, CursorRect, DisplayLayout, Rect};
-use crate::proto::offers::parse_answer;
+use crate::proto::offers::{parse_answer, parse_answers};
 use crate::proto::record::{Opened, RecordOpener};
 
 const MAX_CACHED_CURSORS: usize = 64;
@@ -136,8 +136,19 @@ impl ControlReader {
                         if c.tiles > 0 {
                             self.shared.tiles.store(c.tiles, Ordering::Relaxed);
                         }
-                        self.shared.set_canvas(c.width, c.height);
+                        // With two displays the canvas is both, from the
+                        // display layout; the answer is one display.
+                        if self.shared.second().is_none() {
+                            self.shared.set_canvas(c.width, c.height);
+                        }
                         self.shared.metrics.set_answer_ltrp(c.ltrp);
+                    }
+                    // The second display's answer comes after the first's.
+                    if let Some(second) = self.shared.second()
+                        && let Some(c) = parse_answers(data).get(1).filter(|c| !c.is_degenerate() && c.tiles > 0)
+                    {
+                        tracing::info!("display 2 encoder canvas {}x{} in {} tiles", c.width, c.height, c.tiles);
+                        second.shared.tiles.store(c.tiles, Ordering::Relaxed);
                     }
                 }
                 Rect::RecordKeys(k) => tracing::debug!("ignoring late record-key rect ({} bytes)", k.len()),
@@ -209,6 +220,10 @@ impl ControlReader {
             self.shared.touch(&self.shared.renegotiated);
             self.control.reoffer();
             let _ = self.feedback.send(Feedback::Keyframe(None, KeyframeCause::Reoffer));
+            if let Some(second) = self.shared.second() {
+                second.shared.touch(&second.shared.renegotiated);
+                let _ = second.feedback.send(Feedback::Keyframe(None, KeyframeCause::Reoffer));
+            }
         }
         self.shared.set_canvas(l.backing.0 as u32, l.backing.1 as u32);
     }

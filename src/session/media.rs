@@ -135,7 +135,7 @@ fn record_sender_reports(shared: &Shared, rtcp: &[u8]) {
             srs.insert(ssrc, (mid32, now));
         }
     }
-    let Some(ours) = shared.control.get().map(|c| c.video_ssrc) else {
+    let Some(ours) = shared.our_video_ssrc() else {
         return;
     };
     let samples = rtcp::round_trips(rtcp, ours, rtcp::ntp_middle_now());
@@ -1027,7 +1027,8 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         last_input: Instant::now(),
         gather: GatherStats::new(),
         stats: DecodeStats::new(),
-        dump: open_dump(),
+        // One dump file: the first display's stream only.
+        dump: if shared.is_second() { None } else { open_dump() },
         dead: false,
     };
     while !shared.stopped() && !st.dead {
@@ -1115,11 +1116,34 @@ impl LinkStats {
     }
 }
 
+/// The keys and SSRCs one stream's feedback is sent with.
+pub(super) struct FeedbackKeys {
+    video_key_v: [u8; SRTP_BLOB_LEN],
+    video_ssrc: u32,
+    /// The first stream also sends the audio heartbeat (and polls the
+    /// cursor on the control connection); the second does not.
+    audio: Option<([u8; SRTP_BLOB_LEN], u32)>,
+}
+
+impl FeedbackKeys {
+    pub(super) fn first(offer: &MediaOffer) -> Self {
+        Self {
+            video_key_v: offer.video_key_v,
+            video_ssrc: offer.video_ssrc,
+            audio: Some((offer.audio_key_v, offer.audio_ssrc)),
+        }
+    }
+
+    pub(super) fn second(v2: &crate::proto::offers::SecondVideo) -> Self {
+        Self { video_key_v: v2.key_v, video_ssrc: v2.ssrc, audio: None }
+    }
+}
+
 struct FeedbackSender {
     shared: Arc<Shared>,
     s: FeedbackSockets,
     srtcp: SrtcpSender,
-    audio: SrtpSender,
+    audio: Option<SrtpSender>,
     our_ssrc: u32,
     fir_seq: u8,
     last_keyframe: HashMap<usize, Instant>,
@@ -1187,8 +1211,10 @@ impl FeedbackSender {
     }
 
     fn tick(&mut self, n: u64, dec: &Sender<DecoderMsg>) {
-        let hb = self.audio.protect(AUDIO_PT, &HEARTBEAT_PAYLOAD);
-        let _ = self.s.ctrl.send_to(&hb, self.s.ctrl_dest);
+        if let Some(audio) = &mut self.audio {
+            let hb = audio.protect(AUDIO_PT, &HEARTBEAT_PAYLOAD);
+            let _ = self.s.ctrl.send_to(&hb, self.s.ctrl_dest);
+        }
 
         let ssrcs = self.shared.tile_ssrcs.lock().clone();
         let mut link = Vec::with_capacity(ssrcs.len());
@@ -1225,7 +1251,9 @@ impl FeedbackSender {
         self.check_stall(dec);
 
         // Cursor shapes only arrive in answer to update requests.
-        if let Some(c) = self.shared.control.get() {
+        if self.audio.is_some()
+            && let Some(c) = self.shared.control.get()
+        {
             c.send(&crate::proto::messages::fbu_request(true, 0, 0, 1, 1));
         }
     }
@@ -1255,16 +1283,16 @@ impl FeedbackSender {
 pub(super) fn feedback(
     shared: Arc<Shared>,
     sockets: FeedbackSockets,
-    offer: MediaOffer,
+    keys: FeedbackKeys,
     rx: Receiver<Feedback>,
     dec: Sender<DecoderMsg>,
 ) {
     let mut fs = FeedbackSender {
         shared: shared.clone(),
         s: sockets,
-        srtcp: SrtcpSender::new(&offer.video_key_v),
-        audio: SrtpSender::new(&offer.audio_key_v, offer.audio_ssrc),
-        our_ssrc: offer.video_ssrc,
+        srtcp: SrtcpSender::new(&keys.video_key_v),
+        audio: keys.audio.map(|(key, ssrc)| SrtpSender::new(&key, ssrc)),
+        our_ssrc: keys.video_ssrc,
         fir_seq: 0,
         last_keyframe: HashMap::new(),
         last_ltr: None,
