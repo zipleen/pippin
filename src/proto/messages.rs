@@ -141,16 +141,22 @@ pub fn set_display_configuration(req: &DisplayRequest) -> Vec<u8> {
 
 /// SetDisplayConfiguration for several virtual displays at once (the
 /// message has a display count). With one display it is the same message as
-/// [`set_display_configuration`]. Whether a host makes more than one virtual
-/// display in a High Performance session is not known.
+/// [`set_display_configuration`]. With more, every record is as Apple's
+/// Screen Sharing sends for "two virtual displays" (seen in the unified logs
+/// of screensharingd, macOS 27): display flags 0 (no dynamic resolution),
+/// native and preferred mode index 0 and rotations 7, the same in each
+/// record. The host places the displays side by side itself. Apple's viewer
+/// sends it before SetEncodings; the host then offers one video stream per
+/// display.
 pub fn set_display_configurations(reqs: &[DisplayRequest]) -> Vec<u8> {
     display_configuration_capped(reqs, DisplayRequest::max_backing())
 }
 
 fn display_configuration_capped(reqs: &[DisplayRequest], cap: (u32, u32)) -> Vec<u8> {
     let attributes = DISPLAY_ATTRIBUTES.load(std::sync::atomic::Ordering::Relaxed);
+    let several = reqs.len() > 1;
     let infos: Vec<Vec<u8>> =
-        reqs.iter().enumerate().map(|(i, r)| display_info(r, cap, i, attributes)).collect();
+        reqs.iter().enumerate().map(|(i, r)| display_info(r, cap, i, attributes, several)).collect();
     let body: usize = infos.iter().map(Vec::len).sum();
     let mut msg = vec![0x1d, 0];
     msg.extend_from_slice(&((8 + body) as u16).to_be_bytes());
@@ -163,10 +169,15 @@ fn display_configuration_capped(reqs: &[DisplayRequest], cap: (u32, u32)) -> Vec
     msg
 }
 
-/// One display's info block. Display `index` gets its own name, identifier
-/// (7 + index) and origin (right of the ones before it), as rootshell-vnc
-/// (MIT) does for two virtual displays.
-fn display_info(req: &DisplayRequest, (max_w, max_h): (u32, u32), index: usize, attributes: u32) -> Vec<u8> {
+/// One display's info block. Display `index` gets its own name. `several`:
+/// one of several displays, so no dynamic resolution (as Apple's viewer).
+/// The u16 fields at 0x92 and 0x94 are the native and preferred mode index
+/// and the u32 at 0x96 the rotations, as the host logs them: they are the
+/// same for every display (an older version put the display's x position
+/// and 8 there, a mode index past the end of the list, and the host reset
+/// the connection).
+fn display_info(req: &DisplayRequest, (max_w, max_h): (u32, u32), index: usize, attributes: u32, several: bool)
+    -> Vec<u8> {
     const MODES: [(f64, f64); 5] =
         [(1920.0, 1080.0), (1440.0, 900.0), (1920.0, 1080.0), (1440.0, 810.0), (1312.0, 848.0)];
     let mode_count = MODES.len();
@@ -181,15 +192,15 @@ fn display_info(req: &DisplayRequest, (max_w, max_h): (u32, u32), index: usize, 
         i => format!("pippin Virtual Display {}", i + 1),
     };
     di[2..2 + name.len()].copy_from_slice(name.as_bytes());
-    put32(&mut di, 0x7A, 1); // dynamic resolution
+    put32(&mut di, 0x7A, (!several) as u32); // dynamic resolution
     put32(&mut di, 0x7E, attributes);
     di[0x82..0x86].copy_from_slice(&369.454_56_f32.to_be_bytes());
     di[0x86..0x8A].copy_from_slice(&207.818_17_f32.to_be_bytes());
     put32(&mut di, 0x8A, max_w);
     put32(&mut di, 0x8E, max_h);
-    put16(&mut di, 0x92, (req.backing().0 as usize * index).min(u16::MAX as usize) as u16); // origin x
-    put16(&mut di, 0x94, 0);
-    put32(&mut di, 0x96, 7 + index as u32); // identifier
+    put16(&mut di, 0x92, 0); // native mode index
+    put16(&mut di, 0x94, 0); // preferred mode index
+    put32(&mut di, 0x96, 7); // rotations
     put16(&mut di, 0x9A, mode_count as u16);
 
     let sx = req.width as f64 / 1920.0;
@@ -447,8 +458,17 @@ mod tests {
         assert_eq!(u16::from_be_bytes([two[6], two[7]]), 2, "display count");
         let second = &two[12 + di..];
         assert_eq!(&second[2..2 + 24], b"pippin Virtual Display 2");
-        assert_eq!(u16::from_be_bytes([second[0x92], second[0x93]]), 3840, "right of the first");
-        assert_eq!(u32::from_be_bytes(second[0x96..0x9A].try_into().unwrap()), 8, "own identifier");
+        assert_eq!(di, 296, "Apple's record size: 156 + 5 modes x 28");
+        let u16_at = |r: &[u8], o: usize| u16::from_be_bytes([r[o], r[o + 1]]);
+        let u32_at = |r: &[u8], o: usize| u32::from_be_bytes(r[o..o + 4].try_into().unwrap());
+        for r in [&two[12..12 + di], second] {
+            assert_eq!(u32_at(r, 0x7A), 0, "no dynamic resolution with two displays");
+            assert_eq!((u32_at(r, 0x8A), u32_at(r, 0x8E)), (3840, 2160), "maximum");
+            assert_eq!((u16_at(r, 0x92), u16_at(r, 0x94)), (0, 0), "native and preferred mode index");
+            assert_eq!(u32_at(r, 0x96), 7, "rotations");
+            assert_eq!(u16_at(r, 0x9A), 5, "mode count");
+        }
+        assert_eq!(u32_at(&one[12..], 0x7A), 1, "one display: dynamic resolution");
         assert_eq!(u32::from_be_bytes(two[12 + 0x7E..12 + 0x82].try_into().unwrap()), 4, "default attributes");
     }
 
