@@ -286,6 +286,16 @@ fn offer_plist(mode: i64, session_id: u32, audio: bool, ltr: bool) -> Vec<u8> {
     out
 }
 
+/// The keys, our SSRC and the offer of the second video stream (the second
+/// of two virtual displays).
+#[derive(Clone)]
+pub struct SecondVideo {
+    pub key_v: [u8; SRTP_BLOB_LEN],
+    pub key_s: [u8; SRTP_BLOB_LEN],
+    pub ssrc: u32,
+    offer: Vec<u8>,
+}
+
 /// Everything negotiated in one 0x1c: SRTP keys and our SSRCs.
 #[derive(Clone)]
 pub struct MediaOffer {
@@ -299,17 +309,21 @@ pub struct MediaOffer {
     opts: OfferOptions,
     video_offer: Vec<u8>,
     audio_offer: Vec<u8>,
+    /// A second video stream, for the second of two virtual displays.
+    pub video2: Option<SecondVideo>,
+}
+
+fn random_key() -> [u8; SRTP_BLOB_LEN] {
+    let mut k = [0u8; SRTP_BLOB_LEN];
+    OsRng.fill_bytes(&mut k);
+    k
 }
 
 impl MediaOffer {
     /// `alt_session` drops the second-stream 60 fps bit, as the native
     /// viewer does for a separate login session.
     pub fn generate(audio: bool, alt_session: bool, opts: OfferOptions) -> Self {
-        let key = || {
-            let mut k = [0u8; SRTP_BLOB_LEN];
-            OsRng.fill_bytes(&mut k);
-            k
-        };
+        let key = random_key;
         let (akv, aks, vkv, vks) = (key(), key(), key(), key());
         let video_ssrc = OsRng.next_u32();
         let audio_ssrc = OsRng.next_u32();
@@ -324,7 +338,22 @@ impl MediaOffer {
             opts,
             video_offer: offer_plist(MODE_VIDEO, video_ssrc, false, opts.ltr),
             audio_offer: offer_plist(MODE_AUDIO, audio_ssrc, audio, false),
+            video2: None,
         }
+    }
+
+    /// Adds a second video stream (own keys and SSRC), as Apple's viewer
+    /// offers after asking for two virtual displays. The host answers with
+    /// one stream per display, the second on the next UDP port.
+    pub fn with_second_video(mut self) -> Self {
+        let ssrc = OsRng.next_u32();
+        self.video2 = Some(SecondVideo {
+            key_v: random_key(),
+            key_s: random_key(),
+            ssrc,
+            offer: offer_plist(MODE_VIDEO, ssrc, false, self.opts.ltr),
+        });
+        self
     }
 
     /// Changes the offer for the next [`message`](Self::message), keeping
@@ -332,6 +361,9 @@ impl MediaOffer {
     pub fn set_options(&mut self, opts: OfferOptions) {
         if opts.ltr != self.opts.ltr {
             self.video_offer = offer_plist(MODE_VIDEO, self.video_ssrc, false, opts.ltr);
+            if let Some(v2) = &mut self.video2 {
+                v2.offer = offer_plist(MODE_VIDEO, v2.ssrc, false, opts.ltr);
+            }
         }
         self.opts = opts;
     }
@@ -341,7 +373,9 @@ impl MediaOffer {
     pub fn message(&self) -> Vec<u8> {
         let a = self.audio_offer.len();
         let v = self.video_offer.len();
-        let ms = a + v + 0xD8;
+        // The second video stream: its two keys and offer after the first's.
+        let v2 = self.video2.as_ref().map_or(0, |v2| 0x5C + v2.offer.len());
+        let ms = a + v + 0xD8 + v2;
         let mut buf = vec![0u8; ms + 4];
         buf[0] = 0x1C;
         buf[2..4].copy_from_slice(&(ms as u16).to_be_bytes());
@@ -361,6 +395,13 @@ impl MediaOffer {
         buf[vo..vo + 0x2E].copy_from_slice(&self.video_key_v);
         buf[vo + 0x2E..vo + 0x5C].copy_from_slice(&self.video_key_s);
         buf[vo + 0x5C..vo + 0x5C + v].copy_from_slice(&self.video_offer);
+        if let Some(v2) = &self.video2 {
+            buf[14..16].copy_from_slice(&(v2.offer.len() as u16).to_be_bytes());
+            let o = vo + 0x5C + v;
+            buf[o..o + 0x2E].copy_from_slice(&v2.key_v);
+            buf[o + 0x2E..o + 0x5C].copy_from_slice(&v2.key_s);
+            buf[o + 0x5C..].copy_from_slice(&v2.offer);
+        }
         buf
     }
 }
@@ -401,7 +442,14 @@ fn bplist_len(buf: &[u8]) -> Option<usize> {
 /// Returns `Some` with zero dimensions when an answer is present but the
 /// encoder has not settled on a canvas yet (the caller re-sends the offer).
 pub fn parse_answer(data: &[u8]) -> Option<CanvasInfo> {
-    let mut degenerate = None;
+    let all = parse_answers(data);
+    all.iter().find(|c| !c.is_degenerate()).or(all.first()).copied()
+}
+
+/// Every video canvas answered in `data`, in order (two with two virtual
+/// displays), degenerate ones included.
+pub fn parse_answers(data: &[u8]) -> Vec<CanvasInfo> {
+    let mut out = Vec::new();
     let mut from = 0;
     while let Some(idx) = find(&data[from..], b"bplist").map(|i| i + from) {
         from = idx + 6;
@@ -430,13 +478,10 @@ pub fn parse_answer(data: &[u8]) -> Option<CanvasInfo> {
                     }
                 }
             }
-            if c.width > 0 && c.height > 0 {
-                return Some(c);
-            }
-            degenerate = Some(c);
+            out.push(c);
         }
     }
-    degenerate
+    out
 }
 
 impl CanvasInfo {
@@ -464,6 +509,29 @@ mod tests {
         assert_eq!(&m[0x80..0x86], b"bplist");
         assert_eq!(&m[0x80 + a + 0x5C..0x80 + a + 0x5C + 6], b"bplist");
         assert_eq!(&m[0x80 + a..0x80 + a + 46], &offer.video_key_v);
+    }
+
+    #[test]
+    fn second_video_stream_layout() {
+        let one = MediaOffer::generate(false, false, OfferOptions::default());
+        let offer = one.clone().with_second_video();
+        let v2 = offer.video2.as_ref().unwrap();
+        let m = offer.message();
+        let be16 = |o: usize| u16::from_be_bytes([m[o], m[o + 1]]) as usize;
+        let (a, v, v2_len) = (be16(10), be16(12), be16(14));
+        assert_eq!(v2_len, v2.offer.len());
+        assert_eq!(m.len(), a + v + 0xD8 + 4 + 0x5C + v2_len);
+        assert_eq!(be16(2), m.len() - 4, "length");
+        assert_eq!(&m[6..10], &[0, 0, 0, 7], "60 fps for both streams, no cursor");
+        let o = 0x80 + a + 0x5C + v;
+        assert_eq!(&m[o..o + 46], &v2.key_v);
+        assert_eq!(&m[o + 46..o + 92], &v2.key_s);
+        assert_eq!(&m[o + 92..o + 98], b"bplist");
+        assert_ne!(v2.ssrc, offer.video_ssrc);
+        // Without it: the same layout as before, video2 length 0.
+        let m1 = one.message();
+        assert_eq!(&m1[14..16], &[0, 0]);
+        assert_eq!(m1.len(), a + v + 0xD8 + 4);
     }
 
     #[test]
